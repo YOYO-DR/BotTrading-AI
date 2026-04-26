@@ -18,6 +18,7 @@ Variables de entorno necesarias:
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import sys
@@ -31,6 +32,7 @@ from mcp.client.stdio import stdio_client
 from openai import OpenAI
 
 load_dotenv()
+log = logging.getLogger("mt5_agent")
 
 # ──────────────────────────────────────────────────────────────
 # CONFIGURACIÓN  ← Edita estos valores
@@ -112,9 +114,13 @@ def save_trade(trade_data: dict) -> None:
   memory.append(trade_data)
   with open(MEMORY_FILE, "w", encoding="utf-8") as f:
     json.dump(memory, f, indent=2, ensure_ascii=False)
-  print(f"\n💾  Operación guardada en {MEMORY_FILE}")
-  print(f"    Ticket: {trade_data.get('ticket', 'N/A')} | "
-        f"{trade_data.get('symbol')} {trade_data.get('direction')}")
+  log.info("\n💾  Operación guardada en %s", MEMORY_FILE)
+  log.info(
+    "    Ticket: %s | %s %s",
+    trade_data.get("ticket", "N/A"),
+    trade_data.get("symbol"),
+    trade_data.get("direction"),
+  )
 
 
 def format_memory_for_prompt(memory: list[dict]) -> str:
@@ -245,12 +251,12 @@ async def run_agent() -> None:
   3. Ejecuta tool calls hasta que el modelo tome una decisión final
   4. Guarda la operación si se ejecutó
   """
-  print("=" * 60)
-  print("🤖  MT5 AI Trading Agent")
-  print(f"    Modelo : {MODEL}")
-  print(f"    Símbolos: {', '.join(SYMBOLS)}")
-  print(f"    Timeframes: {', '.join(TIMEFRAMES)}")
-  print("=" * 60)
+  log.info("=" * 60)
+  log.info("🤖  MT5 AI Trading Agent")
+  log.info("    Modelo : %s", MODEL)
+  log.info("    Símbolos: %s", ", ".join(SYMBOLS))
+  log.info("    Timeframes: %s", ", ".join(TIMEFRAMES))
+  log.info("=" * 60)
 
   if not OPENAI_API_KEY:
     raise RuntimeError("Falta OPENAI_API_KEY en variables de entorno o .env")
@@ -286,7 +292,7 @@ async def run_agent() -> None:
 
   async with AsyncExitStack() as stack:
     # ── Conexión al MCP ────────────────────────────────────
-    print("\n🔌  Conectando al servidor MCP de MetaTrader 5...")
+    log.info("\n🔌  Conectando al servidor MCP de MetaTrader 5...")
     try:
       read, write = await asyncio.wait_for(
         stack.enter_async_context(stdio_client(MCP_SERVER)),
@@ -313,8 +319,7 @@ async def run_agent() -> None:
     available_tools = tools_response.tools
     litellm_tools = mcp_tools_to_litellm(available_tools)
 
-    print(f"✅  MCP conectado. Herramientas disponibles: "
-          f"{[t.name for t in available_tools]}\n")
+    log.info("✅  MCP conectado. Herramientas disponibles: %s\n", [t.name for t in available_tools])
 
     # ── Agentic Loop ───────────────────────────────────────
     iteration = 0
@@ -322,7 +327,7 @@ async def run_agent() -> None:
 
     while iteration < MAX_AGENT_ITERATIONS:
       iteration += 1
-      print(f"── Iteración {iteration} {'─' * 40}")
+      log.info("── Iteración %s %s", iteration, "─" * 40)
 
       # Llamada al modelo
       msg, finish_reason = call_model_with_openai_sdk(
@@ -344,21 +349,20 @@ async def run_agent() -> None:
       tool_calls = msg.get("tool_calls") or []
       if finish_reason in ("stop", "end_turn") or not tool_calls:
         content_text = msg.get("content") or ""
-        print(f"\n📋  Respuesta final del modelo:\n{content_text}\n")
+        log.info("\n📋  Respuesta final del modelo:\n%s\n", content_text)
 
         # Extraer decisión JSON
         final_decision = extract_decision(content_text)
 
         if final_decision:
           decision_type = final_decision.get("decision", "UNKNOWN")
-          print(f"🏁  DECISIÓN: {decision_type}")
+          log.info("🏁  DECISIÓN: %s", decision_type)
           if decision_type == "TRADE":
             save_trade(final_decision)
           else:
-            print(
-              f"⛔  Sin entrada. Razón: {final_decision.get('reason', 'N/A')}")
+            log.info("⛔  Sin entrada. Razón: %s", final_decision.get("reason", "N/A"))
         else:
-          print("⚠️  No se encontró bloque de decisión JSON en la respuesta.")
+          log.warning("⚠️  No se encontró bloque de decisión JSON en la respuesta.")
 
         break   # ← Salir del loop
 
@@ -370,8 +374,8 @@ async def run_agent() -> None:
         fn_args = json.loads(fn_args_raw) if isinstance(
           fn_args_raw, str) else fn_args_raw
 
-        print(f"🔧  Llamando herramienta: {fn_name}")
-        print(f"    Args: {json.dumps(fn_args, ensure_ascii=False)[:200]}")
+        log.info("🔧  Llamando herramienta: %s", fn_name)
+        log.info("    Args: %s", json.dumps(fn_args, ensure_ascii=False)[:200])
 
         try:
           result = await session.call_tool(fn_name, arguments=fn_args)
@@ -380,10 +384,10 @@ async def run_agent() -> None:
               block.text if hasattr(block, "text") else str(block)
               for block in result.content
           )
-          print(f"    ✓ Resultado ({len(result_text)} chars)")
+          log.info("    ✓ Resultado (%s chars)", len(result_text))
         except Exception as exc:
           result_text = f"ERROR al ejecutar {fn_name}: {exc}"
-          print(f"    ✗ {result_text}")
+          log.error("    ✗ %s", result_text)
 
         tool_results.append({
             "role": "tool",
@@ -394,15 +398,20 @@ async def run_agent() -> None:
       messages.extend(tool_results)
 
     else:
-      print(
-        f"\n⚠️  Se alcanzó el límite de {MAX_AGENT_ITERATIONS} iteraciones sin decisión final.")
+      log.warning(
+        "\n⚠️  Se alcanzó el límite de %s iteraciones sin decisión final.",
+        MAX_AGENT_ITERATIONS,
+      )
 
-  print("\n" + "=" * 60)
-  print("✅  Ejecución del agente completada.")
+  log.info("\n%s", "=" * 60)
+  log.info("✅  Ejecución del agente completada.")
   if final_decision:
-    print(f"    Decisión: {final_decision.get('decision')} | "
-          f"Símbolo: {final_decision.get('symbol', 'N/A')}")
-  print("=" * 60 + "\n")
+    log.info(
+      "    Decisión: %s | Símbolo: %s",
+      final_decision.get("decision"),
+      final_decision.get("symbol", "N/A"),
+    )
+  log.info("%s\n", "=" * 60)
 
 
 # ──────────────────────────────────────────────────────────────
