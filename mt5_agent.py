@@ -58,12 +58,18 @@ ENFORCE_EXECUTION_WINDOWS = os.getenv("ENFORCE_EXECUTION_WINDOWS", "true").strip
 )
 
 # pares CRT (Gold, NQ, Forex)
-SYMBOLS = [
-  # "XAUUSD", 
-  # "NAS100", 
-  "EURUSD", 
-  # "GBPUSD"
-  ]
+DEFAULT_SYMBOLS = ["EURUSD"]
+SYMBOLS_RAW = os.getenv("SYMBOLS", "").strip()
+if SYMBOLS_RAW:
+  SYMBOLS = [symbol.strip() for symbol in SYMBOLS_RAW.split(",") if symbol.strip()]
+  if not SYMBOLS:
+    raise RuntimeError(
+      "SYMBOLS inválido: no se encontraron símbolos válidos. "
+      "Formato esperado: SYMBOLS=EURUSD,GBPUSD,GOLD#"
+    )
+else:
+  SYMBOLS = DEFAULT_SYMBOLS
+
 # D1 = Daily Bias | H4 = setup CRT | M15 = entrada
 TIMEFRAMES = ["D1", "H4", "M15"]
 MCP_SERVER_COMMAND = os.getenv("MCP_SERVER_COMMAND", "metatrader-mcp-server")
