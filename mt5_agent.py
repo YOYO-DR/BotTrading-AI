@@ -23,7 +23,7 @@ import os
 import shutil
 import sys
 from contextlib import AsyncExitStack
-from datetime import datetime
+from datetime import datetime, time, timezone
 from typing import Any
 import re
 
@@ -50,6 +50,12 @@ LLM_REQUEST_TIMEOUT_SEC = float(os.getenv("LLM_REQUEST_TIMEOUT_SEC", str(CALL_TI
 MCP_TOOL_TIMEOUT_SEC = float(os.getenv("MCP_TOOL_TIMEOUT_SEC", str(CALL_TIMEOUT_SEC)))
 LLM_USER_AGENT = os.getenv("LLM_USER_AGENT", "curl/8.17.0")
 TRADE_LOT_RAW = os.getenv("TRADE_LOT", "0.01")
+EXECUTION_WINDOWS_UTC_RAW = os.getenv("EXECUTION_WINDOWS_UTC", "07:00-11:00,13:30-17:00")
+EXECUTION_WINDOWS_COT_RAW = os.getenv("EXECUTION_WINDOWS_COT", "").strip()
+EXECUTION_COT_UTC_OFFSET_HOURS = float(os.getenv("EXECUTION_COT_UTC_OFFSET_HOURS", "-5"))
+ENFORCE_EXECUTION_WINDOWS = os.getenv("ENFORCE_EXECUTION_WINDOWS", "true").strip().lower() in (
+  "1", "true", "yes", "on"
+)
 
 # pares CRT (Gold, NQ, Forex)
 SYMBOLS = [
@@ -165,6 +171,80 @@ def mcp_tools_to_litellm(mcp_tools) -> list[dict]:
         },
     })
   return result
+
+
+def _parse_hhmm(value: str) -> time:
+  """Parsea una hora HH:MM."""
+  value = value.strip()
+  try:
+    dt = datetime.strptime(value, "%H:%M")
+  except ValueError as exc:
+    raise RuntimeError(f"Hora inválida '{value}'. Formato esperado HH:MM.") from exc
+  return dt.time()
+
+
+def parse_execution_windows(raw: str, var_name: str) -> list[tuple[time, time]]:
+  """Convierte 'HH:MM-HH:MM,HH:MM-HH:MM' en lista de ventanas."""
+  windows: list[tuple[time, time]] = []
+  chunks = [chunk.strip() for chunk in raw.split(",") if chunk.strip()]
+  if not chunks:
+    raise RuntimeError(f"{var_name} no puede estar vacío.")
+
+  for chunk in chunks:
+    if "-" not in chunk:
+      raise RuntimeError(
+        f"Ventana inválida en {var_name}: '{chunk}'. Debe tener formato HH:MM-HH:MM."
+      )
+    start_raw, end_raw = chunk.split("-", 1)
+    start = _parse_hhmm(start_raw)
+    end = _parse_hhmm(end_raw)
+    windows.append((start, end))
+  return windows
+
+
+def _minutes_since_midnight(value: time) -> int:
+  return value.hour * 60 + value.minute
+
+
+def _time_from_minutes(value: int) -> time:
+  value = value % (24 * 60)
+  return time(hour=value // 60, minute=value % 60)
+
+
+def shift_time(value: time, delta_minutes: int) -> time:
+  """Desplaza una hora por minutos con wrap 24h."""
+  return _time_from_minutes(_minutes_since_midnight(value) + delta_minutes)
+
+
+def convert_windows_to_utc(
+    windows: list[tuple[time, time]],
+    source_utc_offset_hours: float,
+) -> list[tuple[time, time]]:
+  """Convierte ventanas desde zona local (offset UTC) a UTC."""
+  # Si local = UTC + offset, entonces UTC = local - offset.
+  delta_minutes = int(round(-source_utc_offset_hours * 60))
+  return [
+    (shift_time(start, delta_minutes), shift_time(end, delta_minutes))
+    for start, end in windows
+  ]
+
+
+def is_time_in_windows_utc(now_time: time, windows: list[tuple[time, time]]) -> bool:
+  """Evalúa si la hora UTC actual cae dentro de al menos una ventana."""
+  for start, end in windows:
+    if start <= end:
+      if start <= now_time <= end:
+        return True
+    else:
+      # Ventana que cruza medianoche, ej: 22:00-02:00.
+      if now_time >= start or now_time <= end:
+        return True
+  return False
+
+
+def format_windows_utc(windows: list[tuple[time, time]]) -> str:
+  """Formatea ventanas UTC para logging/prompt."""
+  return ", ".join(f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')}" for start, end in windows)
 
 
 def get_trade_lot() -> float:
@@ -358,6 +438,37 @@ async def run_agent() -> None:
   4. Guarda la operación si se ejecutó
   """
   log.info("=" * 60)
+
+  now_utc = datetime.now(timezone.utc)
+  if EXECUTION_WINDOWS_COT_RAW:
+    execution_windows_cot = parse_execution_windows(
+      EXECUTION_WINDOWS_COT_RAW,
+      "EXECUTION_WINDOWS_COT",
+    )
+    execution_windows = convert_windows_to_utc(
+      execution_windows_cot,
+      EXECUTION_COT_UTC_OFFSET_HOURS,
+    )
+    log.info(
+      "    Ventanas ejecución COT: %s (offset UTC %s)",
+      format_windows_utc(execution_windows_cot),
+      EXECUTION_COT_UTC_OFFSET_HOURS,
+    )
+  else:
+    execution_windows = parse_execution_windows(
+      EXECUTION_WINDOWS_UTC_RAW,
+      "EXECUTION_WINDOWS_UTC",
+    )
+
+  log.info("    Hora UTC actual: %s", now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"))
+  log.info("    Ventanas ejecución UTC: %s", format_windows_utc(execution_windows))
+
+  if ENFORCE_EXECUTION_WINDOWS and not is_time_in_windows_utc(now_utc.time(), execution_windows):
+    log.info(
+      "⏸️  Fuera de ventana operativa UTC (%s). Se omite esta ejecución.",
+      format_windows_utc(execution_windows),
+    )
+    return
   log.info("🤖  MT5 AI Trading Agent")
   log.info("    Modelo : %s", MODEL)
   log.info("    Símbolos: %s", ", ".join(SYMBOLS))
@@ -390,6 +501,8 @@ async def run_agent() -> None:
   user_message = (
       f"Opera la estrategia CRT (Candle Range Theory) de Cluti Fx para los siguientes activos: "
       f"{', '.join(SYMBOLS)}.\n\n"
+      f"Hora actual UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}.\n"
+      f"Ventanas operativas UTC configuradas: {format_windows_utc(execution_windows)}.\n\n"
       "FLUJO OBLIGATORIO:\n"
       "1. Revisa las posiciones abiertas con la herramienta correspondiente.\n"
       f"2. Para cada activo obtén velas de {', '.join(TIMEFRAMES)}.\n"
