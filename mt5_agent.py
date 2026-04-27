@@ -44,8 +44,10 @@ MEMORY_FILE = "trade_memory.json"       # historial de operaciones
 STRATEGY_FILE = "strategy.md"           # prompt del sistema en markdown
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 BASE_URL = os.getenv("BASE_URL", "")
-MCP_CONNECT_TIMEOUT_SEC = float(os.getenv("MCP_CONNECT_TIMEOUT_SEC", "30"))
-LLM_REQUEST_TIMEOUT_SEC = float(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "90"))
+CALL_TIMEOUT_SEC = float(os.getenv("CALL_TIMEOUT_SEC", "100"))
+MCP_CONNECT_TIMEOUT_SEC = float(os.getenv("MCP_CONNECT_TIMEOUT_SEC", str(CALL_TIMEOUT_SEC)))
+LLM_REQUEST_TIMEOUT_SEC = float(os.getenv("LLM_REQUEST_TIMEOUT_SEC", str(CALL_TIMEOUT_SEC)))
+MCP_TOOL_TIMEOUT_SEC = float(os.getenv("MCP_TOOL_TIMEOUT_SEC", str(CALL_TIMEOUT_SEC)))
 LLM_USER_AGENT = os.getenv("LLM_USER_AGENT", "curl/8.17.0")
 TRADE_LOT_RAW = os.getenv("TRADE_LOT", "0.01")
 
@@ -360,6 +362,13 @@ async def run_agent() -> None:
   log.info("    Modelo : %s", MODEL)
   log.info("    Símbolos: %s", ", ".join(SYMBOLS))
   log.info("    Timeframes: %s", ", ".join(TIMEFRAMES))
+  log.info(
+    "    Timeouts(s) -> default:%s | mcp_connect:%s | mcp_tool:%s | llm_request:%s",
+    CALL_TIMEOUT_SEC,
+    MCP_CONNECT_TIMEOUT_SEC,
+    MCP_TOOL_TIMEOUT_SEC,
+    LLM_REQUEST_TIMEOUT_SEC,
+  )
   log.info("=" * 60)
 
   if not OPENAI_API_KEY:
@@ -426,7 +435,10 @@ async def run_agent() -> None:
       ) from exc
 
     # ── Obtener herramientas disponibles ──────────────────
-    tools_response = await session.list_tools()
+    tools_response = await asyncio.wait_for(
+      session.list_tools(),
+      timeout=MCP_TOOL_TIMEOUT_SEC,
+    )
     available_tools = tools_response.tools
     litellm_tools = mcp_tools_to_litellm(available_tools)
 
@@ -517,7 +529,10 @@ async def run_agent() -> None:
         log.info("    Args: %s", json.dumps(fn_args, ensure_ascii=False)[:200])
 
         try:
-          result = await session.call_tool(fn_name, arguments=fn_args)
+          result = await asyncio.wait_for(
+            session.call_tool(fn_name, arguments=fn_args),
+            timeout=MCP_TOOL_TIMEOUT_SEC,
+          )
           # Convertir resultado MCP a texto
           result_text = " ".join(
               block.text if hasattr(block, "text") else str(block)
