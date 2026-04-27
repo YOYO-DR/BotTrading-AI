@@ -50,22 +50,63 @@ LLM_REQUEST_TIMEOUT_SEC = float(os.getenv("LLM_REQUEST_TIMEOUT_SEC", str(CALL_TI
 MCP_TOOL_TIMEOUT_SEC = float(os.getenv("MCP_TOOL_TIMEOUT_SEC", str(CALL_TIMEOUT_SEC)))
 LLM_USER_AGENT = os.getenv("LLM_USER_AGENT", "curl/8.17.0")
 TRADE_LOT_RAW = os.getenv("TRADE_LOT", "0.01")
+REQUIRE_SL_ON_MARKET_ORDER = os.getenv("REQUIRE_SL_ON_MARKET_ORDER", "true").strip().lower() in (
+  "1", "true", "yes", "on"
+)
+REQUIRE_TP_ON_ENTRY = os.getenv("REQUIRE_TP_ON_ENTRY", "true").strip().lower() in (
+  "1", "true", "yes", "on"
+)
 EXECUTION_WINDOWS_UTC_RAW = os.getenv("EXECUTION_WINDOWS_UTC", "07:00-11:00,13:30-17:00")
 EXECUTION_WINDOWS_COT_RAW = os.getenv("EXECUTION_WINDOWS_COT", "").strip()
 EXECUTION_COT_UTC_OFFSET_HOURS = float(os.getenv("EXECUTION_COT_UTC_OFFSET_HOURS", "-5"))
 ENFORCE_EXECUTION_WINDOWS = os.getenv("ENFORCE_EXECUTION_WINDOWS", "true").strip().lower() in (
   "1", "true", "yes", "on"
 )
+POSITION_REVIEW_BEFORE_NEW_ENTRY = os.getenv("POSITION_REVIEW_BEFORE_NEW_ENTRY", "true").strip().lower() in (
+  "1", "true", "yes", "on"
+)
+BLOCK_ORDER_OUTSIDE_WINDOWS = os.getenv("BLOCK_ORDER_OUTSIDE_WINDOWS", "true").strip().lower() in (
+  "1", "true", "yes", "on"
+)
 
 # pares CRT (Gold, NQ, Forex)
 DEFAULT_SYMBOLS = ["EURUSD"]
 SYMBOLS_RAW = os.getenv("SYMBOLS", "").strip()
+SYMBOL_LOTS: dict[str, float] = {}
 if SYMBOLS_RAW:
-  SYMBOLS = [symbol.strip() for symbol in SYMBOLS_RAW.split(",") if symbol.strip()]
+  SYMBOLS: list[str] = []
+  for symbol_chunk in [chunk.strip() for chunk in SYMBOLS_RAW.split(",") if chunk.strip()]:
+    symbol_name = symbol_chunk
+    if ":" in symbol_chunk:
+      symbol_name, lot_raw = symbol_chunk.rsplit(":", 1)
+      symbol_name = symbol_name.strip()
+      lot_raw = lot_raw.strip()
+
+      if not symbol_name:
+        raise RuntimeError(
+          f"SYMBOLS inválido en segmento '{symbol_chunk}'. Debe tener símbolo antes de ':'."
+        )
+      try:
+        symbol_lot = float(lot_raw)
+      except ValueError as exc:
+        raise RuntimeError(
+          f"Lotaje inválido para {symbol_name} en SYMBOLS: '{lot_raw}'. Debe ser numérico."
+        ) from exc
+      if symbol_lot <= 0:
+        raise RuntimeError(
+          f"Lotaje inválido para {symbol_name} en SYMBOLS: {symbol_lot}. Debe ser > 0."
+        )
+      SYMBOL_LOTS[symbol_name.upper()] = symbol_lot
+    else:
+      symbol_name = symbol_name.strip()
+
+    if symbol_name:
+      SYMBOLS.append(symbol_name)
+
   if not SYMBOLS:
     raise RuntimeError(
       "SYMBOLS inválido: no se encontraron símbolos válidos. "
-      "Formato esperado: SYMBOLS=EURUSD,GBPUSD,GOLD#"
+      "Formato esperado: SYMBOLS=EURUSD,GBPUSD,GOLD# o SYMBOLS=EURUSD:0.01,GBPUSD:0.02"
     )
 else:
   SYMBOLS = DEFAULT_SYMBOLS
@@ -126,10 +167,11 @@ def load_memory() -> list[dict]:
 def save_trade(trade_data: dict) -> None:
   """Guarda una operación ejecutada en la memoria persistente."""
   memory = load_memory()
+  trade_data.setdefault("trade_status", "OPEN")
+  trade_data.setdefault("opened_at", datetime.now().isoformat())
   trade_data["saved_at"] = datetime.now().isoformat()
   memory.append(trade_data)
-  with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-    json.dump(memory, f, indent=2, ensure_ascii=False)
+  save_memory(memory)
   log.info("\n💾  Operación guardada en %s", MEMORY_FILE)
   log.info(
     "    Ticket: %s | %s %s",
@@ -137,6 +179,12 @@ def save_trade(trade_data: dict) -> None:
     trade_data.get("symbol"),
     trade_data.get("direction"),
   )
+
+
+def save_memory(memory: list[dict]) -> None:
+  """Persiste en disco la memoria completa de operaciones."""
+  with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+    json.dump(memory, f, indent=2, ensure_ascii=False)
 
 
 def format_memory_for_prompt(memory: list[dict]) -> str:
@@ -293,6 +341,11 @@ def get_trade_lot() -> float:
   return lot
 
 
+def get_trade_lot_for_symbol(symbol: str, default_lot: float) -> float:
+  """Obtiene lotaje por símbolo (SYMBOLS=SYM:LOT) o usa TRADE_LOT por defecto."""
+  return SYMBOL_LOTS.get(symbol.upper(), default_lot)
+
+
 def enforce_fixed_lot(fn_args: Any, fixed_lot: float) -> tuple[dict[str, Any], bool]:
   """Fuerza el lotaje fijo para órdenes, ignorando cualquier lote propuesto por el modelo."""
   if not isinstance(fn_args, dict):
@@ -350,6 +403,195 @@ def _find_ticket_in_obj(obj: Any) -> int | None:
       if ticket:
         return ticket
   return None
+
+
+def _collect_tickets_in_obj(obj: Any, tickets: set[int]) -> None:
+  """Recolecta todos los tickets detectables en estructuras JSON."""
+  if isinstance(obj, dict):
+    for key in ("ticket", "order_ticket", "position_ticket", "deal_ticket"):
+      ticket = _extract_positive_int(obj.get(key))
+      if ticket:
+        tickets.add(ticket)
+    for value in obj.values():
+      _collect_tickets_in_obj(value, tickets)
+    return
+  if isinstance(obj, list):
+    for item in obj:
+      _collect_tickets_in_obj(item, tickets)
+
+
+def extract_tickets_from_tool_result(result_text: str) -> set[int]:
+  """Extrae todos los tickets presentes en un resultado de tool (JSON o texto)."""
+  tickets: set[int] = set()
+
+  try:
+    parsed = json.loads(result_text)
+    _collect_tickets_in_obj(parsed, tickets)
+  except Exception:
+    pass
+
+  for candidate in re.findall(r"\{[^{}]*\}", result_text):
+    try:
+      parsed = json.loads(candidate)
+      _collect_tickets_in_obj(parsed, tickets)
+    except Exception:
+      continue
+
+  for match in re.finditer(r"(?i)(?:ticket|position_ticket|order_ticket|deal_ticket)\D{0,10}(\d{3,})", result_text):
+    ticket = _extract_positive_int(match.group(1))
+    if ticket:
+      tickets.add(ticket)
+
+  return tickets
+
+
+def infer_close_reason_from_deals(deals_text: str, ticket: int) -> str:
+  """Intenta inferir si un ticket cerró por TP/SL usando texto de deals."""
+  ticket_text = str(ticket)
+  lower = deals_text.lower()
+  index = lower.find(ticket_text.lower())
+  if index == -1:
+    return "CLOSED_UNKNOWN"
+
+  start = max(0, index - 240)
+  end = min(len(lower), index + 240)
+  window = lower[start:end]
+
+  if re.search(r"\b(tp|take\s*profit|take_profit)\b", window):
+    return "CLOSED_TP"
+  if re.search(r"\b(sl|stop\s*loss|stop_loss)\b", window):
+    return "CLOSED_SL"
+  return "CLOSED_UNKNOWN"
+
+
+def get_numeric_arg(fn_args: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+  """Devuelve el primer valor numérico positivo para alguna clave candidata."""
+  for key in keys:
+    if key not in fn_args:
+      continue
+    raw_value = fn_args.get(key)
+    if isinstance(raw_value, bool) or raw_value is None:
+      continue
+    try:
+      numeric_value = float(raw_value)
+    except (TypeError, ValueError):
+      continue
+    if numeric_value > 0:
+      return numeric_value
+  return None
+
+
+def validate_market_order_risk_args(fn_args: dict[str, Any]) -> tuple[bool, bool, str | None]:
+  """Valida que una entrada market tenga SL obligatorio y TP según política."""
+  sl_value = get_numeric_arg(fn_args, ("sl", "stop_loss", "stopLoss", "stoploss"))
+  tp_value = get_numeric_arg(fn_args, ("tp", "take_profit", "takeProfit", "takeprofit"))
+
+  if REQUIRE_SL_ON_MARKET_ORDER and sl_value is None:
+    return (
+      False,
+      False,
+      "Bloqueado: place_market_order requiere SL obligatorio (sl/stop_loss) con valor > 0.",
+    )
+
+  if REQUIRE_TP_ON_ENTRY and tp_value is None:
+    return (
+      True,
+      False,
+      "Aviso: place_market_order sin TP. Debes agregar TP en la orden o con modify_position antes de finalizar TRADE.",
+    )
+
+  return True, tp_value is not None, None
+
+
+async def get_open_positions_snapshot(
+    session: ClientSession,
+    symbol: str,
+) -> tuple[str, set[int]]:
+  """Consulta posiciones abiertas por símbolo y devuelve texto crudo + tickets detectados."""
+  try:
+    result = await asyncio.wait_for(
+      session.call_tool("get_positions_by_symbol", arguments={"symbol": symbol}),
+      timeout=MCP_TOOL_TIMEOUT_SEC,
+    )
+    result_text = " ".join(
+      block.text if hasattr(block, "text") else str(block)
+      for block in result.content
+    )
+    return result_text, extract_tickets_from_tool_result(result_text)
+  except Exception as exc:
+    error_text = f"ERROR precheck get_positions_by_symbol: {exc}"
+    return error_text, set()
+
+
+async def reconcile_symbol_trades_with_broker_state(
+    session: ClientSession,
+    symbol: str,
+    open_tickets: set[int],
+) -> list[str]:
+  """Marca operaciones del símbolo como cerradas cuando ya no están abiertas en broker."""
+  memory = load_memory()
+  if not memory:
+    return []
+
+  tracked_open_entries: list[dict] = []
+  for trade in memory:
+    if str(trade.get("symbol", "")).upper() != symbol.upper():
+      continue
+    if str(trade.get("decision", "")).upper() != "TRADE":
+      continue
+    ticket = _extract_positive_int(trade.get("ticket"))
+    if not ticket:
+      continue
+    status = str(trade.get("trade_status", "OPEN")).upper()
+    if status.startswith("CLOSED"):
+      continue
+    tracked_open_entries.append(trade)
+
+  if not tracked_open_entries:
+    return []
+
+  tracked_open_tickets = {
+    _extract_positive_int(trade.get("ticket"))
+    for trade in tracked_open_entries
+    if _extract_positive_int(trade.get("ticket"))
+  }
+  closed_tickets = tracked_open_tickets - open_tickets
+  if not closed_tickets:
+    return []
+
+  deals_text = ""
+  try:
+    deals_result = await asyncio.wait_for(
+      session.call_tool("get_deals", arguments={}),
+      timeout=MCP_TOOL_TIMEOUT_SEC,
+    )
+    deals_text = " ".join(
+      block.text if hasattr(block, "text") else str(block)
+      for block in deals_result.content
+    )
+  except Exception as exc:
+    log.warning(
+      "⚠️  [%s] No se pudo consultar get_deals para inferir motivo de cierre: %s",
+      symbol,
+      exc,
+    )
+
+  now_iso = datetime.now().isoformat()
+  updates: list[str] = []
+  for trade in tracked_open_entries:
+    ticket = _extract_positive_int(trade.get("ticket"))
+    if not ticket or ticket not in closed_tickets:
+      continue
+
+    close_reason = infer_close_reason_from_deals(deals_text, ticket) if deals_text else "CLOSED_UNKNOWN"
+    trade["trade_status"] = close_reason
+    trade["closed_at"] = now_iso
+    updates.append(f"Ticket {ticket} -> {close_reason}")
+
+  if updates:
+    save_memory(memory)
+
+  return updates
 
 
 def extract_ticket_from_tool_result(result_text: str) -> int | None:
@@ -469,20 +711,29 @@ def build_user_message_for_symbol(
       f"Hora actual UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}.\n"
       f"Ventanas operativas UTC configuradas: {format_windows_utc(execution_windows)}.\n\n"
       "FLUJO OBLIGATORIO:\n"
-      "1. Revisa las posiciones abiertas con la herramienta correspondiente.\n"
+      "1. Si hay posiciones abiertas del símbolo, primero haz gestión de posiciones: "
+      "evalúa si se dejan abiertas o se cierran con close_position/close_all_positions_by_symbol. "
+      "No busques nueva entrada hasta completar esta revisión.\n"
       f"2. Para este activo obtén velas de {', '.join(TIMEFRAMES)}.\n"
       "3. Determina el Daily Bias en D1 (alcista / bajista / ambiguo).\n"
       "4. Si el bias está definido, identifica el setup CRT en H4 (velas 1am/5am EST de referencia).\n"
       "5. Baja a M15 para confirmar la Vela 3 (cierre dentro del rango) y buscar confluencias "
       "(Order Block, FVG, Killzone).\n"
-      "6. Si todos los filtros pasan, ejecuta la operación con SL y TP definidos (RR >= 2) "
-      "usando place_market_order o place_pending_order.\n"
+      "6. Si todos los filtros pasan, ejecuta SI O SI la operación con place_market_order "
+      "(obligatorio). No simules ejecución, no la dejes pendiente y no cierres análisis sin llamar la tool.\n"
       f"7. LOTAJE FIJO OBLIGATORIO: usa exactamente {fixed_lot} lotes. "
       "No propongas ni uses otro volumen.\n"
-      "8. SOLO devuelve decision=TRADE si la orden fue ejecutada y tienes ticket real (>0). "
-      "Si no hay ticket válido, devuelve NO_ENTRY.\n"
-      "9. No mezcles análisis ni velas con otros símbolos. Este contexto es exclusivo de este activo.\n"
-      "10. Responde con el bloque JSON de decisión."
+      "8. En place_market_order el Stop Loss (SL) es obligatorio. "
+      "Si la tool permite TP en la entrada, inclúyelo de una vez; si no, agrega TP inmediatamente con modify_position.\n"
+      "9. SOLO devuelve decision=TRADE si ejecutaste place_market_order en esta corrida y tienes ticket real (>0). "
+      "Si no ejecutaste la tool o no hay ticket válido, devuelve NO_ENTRY.\n"
+      "10. Si estás fuera de las ventanas operativas UTC, NO debes llamar place_market_order. "
+      "En ese caso finaliza con NO_ENTRY sin ejecutar órdenes.\n"
+      "11. Está prohibido inventar o estimar tickets. El ticket debe venir de la respuesta real de la tool.\n"
+      "12. Si detectas posiciones previamente abiertas, reporta en la decisión el estado de seguimiento: "
+      "dejar abierta / cerrar / cerrada por SL / cerrada por TP (si la data del broker lo permite).\n"
+      "13. No mezcles análisis ni velas con otros símbolos. Este contexto es exclusivo de este activo.\n"
+      "14. Responde con el bloque JSON de decisión."
   )
 
 
@@ -503,11 +754,39 @@ async def run_symbol_agent_loop(
     fixed_lot=fixed_lot,
   )
 
-  messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+  if POSITION_REVIEW_BEFORE_NEW_ENTRY:
+    open_positions_snapshot, open_tickets = await get_open_positions_snapshot(session, symbol)
+    reconciliation_updates = await reconcile_symbol_trades_with_broker_state(
+      session=session,
+      symbol=symbol,
+      open_tickets=open_tickets,
+    )
+
+    precheck_message = (
+      f"PRECHECK POSICIONES ABIERTAS ({symbol}): {len(open_tickets)} detectadas.\n"
+      f"Snapshot broker (resumen): {open_positions_snapshot[:1800]}\n"
+    )
+    if reconciliation_updates:
+      precheck_message += "Actualizaciones de seguimiento en memoria: " + "; ".join(reconciliation_updates)
+    else:
+      precheck_message += "Actualizaciones de seguimiento en memoria: ninguna."
+  else:
+    precheck_message = (
+      "PRECHECK POSICIONES ABIERTAS desactivado por configuración "
+      "(POSITION_REVIEW_BEFORE_NEW_ENTRY=false)."
+    )
+
+  inside_execution_window = is_time_in_windows_utc(now_utc.time(), execution_windows)
+
+  messages: list[dict[str, Any]] = [{"role": "user", "content": f"{user_message}\n\n{precheck_message}"}]
   iteration = 0
   final_decision = None
   executed_order_ticket: int | None = None
   attempted_order_placement = False
+  attempted_market_order = False
+  market_order_without_tp = False
+  tp_added_after_entry = False
+  last_market_order_type: str | None = None
 
   while iteration < MAX_AGENT_ITERATIONS:
     iteration += 1
@@ -537,12 +816,60 @@ async def run_symbol_agent_loop(
 
       if final_decision:
         final_decision.setdefault("symbol", symbol)
+        if executed_order_ticket and str(final_decision.get("decision", "")).upper() != "TRADE":
+          previous_decision = final_decision.get("decision")
+          log.warning(
+            "⚠️  [%s] El modelo devolvió %s pero existe ticket real ejecutado (%s). Se corrige a TRADE.",
+            symbol,
+            previous_decision,
+            executed_order_ticket,
+          )
+          final_decision["decision"] = "TRADE"
+          final_decision["ticket"] = executed_order_ticket
+          if not final_decision.get("direction") and last_market_order_type:
+            final_decision["direction"] = last_market_order_type
+          existing_reason = str(final_decision.get("reason", "")).strip()
+          correction_reason = (
+            f"Ajuste automático: se ejecutó orden real con ticket {executed_order_ticket}; "
+            "no se permite reportar NO_ENTRY cuando hay ejecución real."
+          )
+          final_decision["reason"] = (
+            f"{existing_reason} | {correction_reason}" if existing_reason else correction_reason
+          )
+
         decision_type = final_decision.get("decision", "UNKNOWN")
         log.info("🏁  [%s] DECISIÓN: %s", symbol, decision_type)
 
         if decision_type == "TRADE":
+          if not attempted_market_order:
+            log.warning(
+              "⚠️  [%s] El modelo devolvió TRADE sin ejecutar place_market_order. Se fuerza NO_ENTRY.",
+              symbol,
+            )
+            final_decision["decision"] = "NO_ENTRY"
+            final_decision["ticket"] = None
+            final_decision["reason"] = (
+              "Entrada detectada pero no se ejecutó place_market_order real; "
+              "se invalida TRADE para evitar ticket ficticio."
+            )
+            log.info("⛔  [%s] Sin entrada. Razón: %s", symbol, final_decision.get("reason", "N/A"))
+            return final_decision
+
+          if REQUIRE_TP_ON_ENTRY and market_order_without_tp and not tp_added_after_entry:
+            log.warning(
+              "⚠️  [%s] TRADE inválido: se ejecutó entrada sin TP y no se agregó TP luego con modify_position.",
+              symbol,
+            )
+            final_decision["decision"] = "NO_ENTRY"
+            final_decision["ticket"] = None
+            final_decision["reason"] = (
+              "Entrada ejecutada sin TP. Debe incluir TP en place_market_order o agregarlo con modify_position."
+            )
+            log.info("⛔  [%s] Sin entrada. Razón: %s", symbol, final_decision.get("reason", "N/A"))
+            return final_decision
+
           model_ticket = _extract_positive_int(final_decision.get("ticket"))
-          resolved_ticket = model_ticket or executed_order_ticket
+          resolved_ticket = executed_order_ticket or model_ticket
 
           if resolved_ticket:
             final_decision["ticket"] = resolved_ticket
@@ -580,13 +907,49 @@ async def run_symbol_agent_loop(
         fn_args, lot_overridden = enforce_fixed_lot(fn_args, fixed_lot)
         if lot_overridden:
           log.info(
-            "    [%s] ℹ️ Lote forzado por configuración TRADE_LOT=%s (se ignoró el lote propuesto por el modelo).",
+            "    [%s] ℹ️ Lote forzado por configuración del símbolo (%s lotes).",
             symbol,
             fixed_lot,
           )
 
       log.info("🔧  [%s] Llamando herramienta: %s", symbol, fn_name)
       log.info("    [%s] Args: %s", symbol, json.dumps(fn_args, ensure_ascii=False)[:200])
+
+      if fn_name == "place_market_order":
+        if BLOCK_ORDER_OUTSIDE_WINDOWS and not inside_execution_window:
+          blocked_msg = (
+            "Bloqueado: fuera de ventana operativa UTC. "
+            "No se permite ejecutar place_market_order en este horario."
+          )
+          log.info("    [%s] %s", symbol, blocked_msg)
+          tool_results.append({
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "content": f"ERROR validación horario: {blocked_msg}",
+          })
+          continue
+
+        is_valid_risk, has_tp_in_order, risk_msg = validate_market_order_risk_args(fn_args)
+        if risk_msg:
+          log.info("    [%s] %s", symbol, risk_msg)
+        if not is_valid_risk:
+          tool_results.append({
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "content": f"ERROR validación riesgo: {risk_msg}",
+          })
+          continue
+        if REQUIRE_TP_ON_ENTRY and not has_tp_in_order:
+          market_order_without_tp = True
+
+        order_type = fn_args.get("type") if isinstance(fn_args, dict) else None
+        if isinstance(order_type, str):
+          last_market_order_type = order_type.upper()
+
+      if fn_name == "modify_position":
+        tp_after = get_numeric_arg(fn_args if isinstance(fn_args, dict) else {}, ("tp", "take_profit", "takeProfit", "takeprofit"))
+        if tp_after is not None:
+          tp_added_after_entry = tp_added_after_entry or attempted_market_order
 
       try:
         result = await asyncio.wait_for(
@@ -601,6 +964,8 @@ async def run_symbol_agent_loop(
 
         if fn_name in ("place_market_order", "place_pending_order"):
           attempted_order_placement = True
+          if fn_name == "place_market_order":
+            attempted_market_order = True
           parsed_ticket = extract_ticket_from_tool_result(result_text)
           if parsed_ticket:
             executed_order_ticket = parsed_ticket
@@ -674,6 +1039,12 @@ async def run_agent() -> None:
   log.info("🤖  MT5 AI Trading Agent")
   log.info("    Modelo : %s", MODEL)
   log.info("    Símbolos: %s", ", ".join(SYMBOLS))
+  default_lot = get_trade_lot()
+  symbol_lots_preview = [
+    f"{symbol}:{get_trade_lot_for_symbol(symbol, default_lot)}"
+    for symbol in SYMBOLS
+  ]
+  log.info("    Lotaje por símbolo: %s", ", ".join(symbol_lots_preview))
   log.info("    Timeframes: %s", ", ".join(TIMEFRAMES))
   log.info(
     "    Timeouts(s) -> default:%s | mcp_connect:%s | mcp_tool:%s | llm_request:%s",
@@ -686,8 +1057,6 @@ async def run_agent() -> None:
 
   if not OPENAI_API_KEY:
     raise RuntimeError("Falta OPENAI_API_KEY en variables de entorno o .env")
-
-  fixed_lot = get_trade_lot()
 
   if shutil.which(MCP_SERVER_COMMAND) is None:
     raise RuntimeError(
@@ -735,6 +1104,7 @@ async def run_agent() -> None:
     # ── Ejecución independiente por símbolo ────────────────
     symbol_decisions: list[dict] = []
     for symbol in SYMBOLS:
+      symbol_lot = get_trade_lot_for_symbol(symbol, default_lot)
       log.info("\n📈  Iniciando análisis independiente para %s", symbol)
       symbol_memory_text = format_memory_for_symbol(memory, symbol)
       system_prompt = system_prompt_template.format(memory=symbol_memory_text)
@@ -746,7 +1116,7 @@ async def run_agent() -> None:
           execution_windows=execution_windows,
           system_prompt=system_prompt,
           litellm_tools=litellm_tools,
-          fixed_lot=fixed_lot,
+          fixed_lot=symbol_lot,
         )
       except Exception as exc:
         log.error("❌  Error analizando %s: %s", symbol, exc, exc_info=True)
