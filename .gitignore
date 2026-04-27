@@ -3,3 +3,4 @@
 __pycache__/
 env/
 venv/
+trade_memory.json

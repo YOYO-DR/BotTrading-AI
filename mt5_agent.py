@@ -25,6 +25,7 @@ import sys
 from contextlib import AsyncExitStack
 from datetime import datetime
 from typing import Any
+import re
 
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
@@ -163,6 +164,71 @@ def mcp_tools_to_litellm(mcp_tools) -> list[dict]:
   return result
 
 
+def _extract_positive_int(value: Any) -> int | None:
+  """Devuelve entero positivo si el valor puede interpretarse como ticket."""
+  if isinstance(value, bool) or value is None:
+    return None
+  if isinstance(value, int):
+    return value if value > 0 else None
+  if isinstance(value, float):
+    int_value = int(value)
+    return int_value if int_value > 0 else None
+  if isinstance(value, str):
+    value = value.strip()
+    if value.isdigit():
+      int_value = int(value)
+      return int_value if int_value > 0 else None
+  return None
+
+
+def _find_ticket_in_obj(obj: Any) -> int | None:
+  """Busca ticket recursivamente en estructuras JSON comunes."""
+  if isinstance(obj, dict):
+    for key in ("ticket", "order_ticket", "position_ticket", "deal_ticket"):
+      ticket = _extract_positive_int(obj.get(key))
+      if ticket:
+        return ticket
+    for value in obj.values():
+      ticket = _find_ticket_in_obj(value)
+      if ticket:
+        return ticket
+    return None
+  if isinstance(obj, list):
+    for item in obj:
+      ticket = _find_ticket_in_obj(item)
+      if ticket:
+        return ticket
+  return None
+
+
+def extract_ticket_from_tool_result(result_text: str) -> int | None:
+  """Extrae ticket desde texto de resultado MCP (JSON o texto plano)."""
+  # 1) Intentar parseo JSON completo
+  try:
+    parsed = json.loads(result_text)
+    ticket = _find_ticket_in_obj(parsed)
+    if ticket:
+      return ticket
+  except Exception:
+    pass
+
+  # 2) Intentar encontrar fragmentos JSON dentro del texto
+  for candidate in re.findall(r"\{[^{}]*\}", result_text):
+    try:
+      parsed = json.loads(candidate)
+      ticket = _find_ticket_in_obj(parsed)
+      if ticket:
+        return ticket
+    except Exception:
+      continue
+
+  # 3) Fallback regex simple
+  match = re.search(r"(?i)ticket\D{0,10}(\d{3,})", result_text)
+  if match:
+    return _extract_positive_int(match.group(1))
+  return None
+
+
 def get_openai_client() -> OpenAI:
   """Inicializa cliente OpenAI compatible con base_url custom (LiteLLM proxy)."""
   global _OPENAI_CLIENT
@@ -282,8 +348,11 @@ async def run_agent() -> None:
       "4. Si el bias está definido, identifica el setup CRT en H4 (velas 1am/5am EST de referencia).\n"
       "5. Baja a M15 para confirmar la Vela 3 (cierre dentro del rango) y buscar confluencias "
       "(Order Block, FVG, Killzone).\n"
-      "6. Si todos los filtros pasan, ejecuta la operación con SL y TP definidos (RR >= 2).\n"
-      "7. Responde con el bloque JSON de decisión."
+        "6. Si todos los filtros pasan, ejecuta la operación con SL y TP definidos (RR >= 2) "
+        "usando place_market_order o place_pending_order.\n"
+        "7. SOLO devuelve decision=TRADE si la orden fue ejecutada y tienes ticket real (>0). "
+        "Si no hay ticket válido, devuelve NO_ENTRY.\n"
+        "8. Responde con el bloque JSON de decisión."
   )
 
   messages = [
@@ -324,6 +393,8 @@ async def run_agent() -> None:
     # ── Agentic Loop ───────────────────────────────────────
     iteration = 0
     final_decision = None
+    executed_order_ticket: int | None = None
+    attempted_order_placement = False
 
     while iteration < MAX_AGENT_ITERATIONS:
       iteration += 1
@@ -358,7 +429,25 @@ async def run_agent() -> None:
           decision_type = final_decision.get("decision", "UNKNOWN")
           log.info("🏁  DECISIÓN: %s", decision_type)
           if decision_type == "TRADE":
-            save_trade(final_decision)
+            model_ticket = _extract_positive_int(final_decision.get("ticket"))
+            resolved_ticket = model_ticket or executed_order_ticket
+
+            if resolved_ticket:
+              final_decision["ticket"] = resolved_ticket
+              save_trade(final_decision)
+            else:
+              log.warning(
+                "⚠️  El modelo devolvió TRADE sin ticket real. No se guardará como operación ejecutada."
+              )
+              if attempted_order_placement:
+                log.warning(
+                  "⚠️  Hubo intento de colocar orden, pero no se obtuvo ticket válido en la respuesta del broker."
+                )
+              else:
+                log.warning(
+                  "⚠️  No hubo llamada a place_market_order/place_pending_order. "
+                  "Esto indica análisis hipotético, no ejecución real."
+                )
           else:
             log.info("⛔  Sin entrada. Razón: %s", final_decision.get("reason", "N/A"))
         else:
@@ -385,6 +474,15 @@ async def run_agent() -> None:
               for block in result.content
           )
           log.info("    ✓ Resultado (%s chars)", len(result_text))
+
+          if fn_name in ("place_market_order", "place_pending_order"):
+            attempted_order_placement = True
+            parsed_ticket = extract_ticket_from_tool_result(result_text)
+            if parsed_ticket:
+              executed_order_ticket = parsed_ticket
+              log.info("    ✓ Ticket detectado en ejecución real: %s", parsed_ticket)
+            else:
+              log.warning("    ⚠️ Orden enviada pero no se pudo extraer ticket del resultado.")
         except Exception as exc:
           result_text = f"ERROR al ejecutar {fn_name}: {exc}"
           log.error("    ✗ %s", result_text)

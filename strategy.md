@@ -267,6 +267,20 @@ Marcar siempre los rangos de estas velas como niveles prioritarios.
 - Si pierde 2 trades consecutivos: PARAR por el día.
 - Break Even al 50% del recorrido hacia el target.
 
+## REGLA 9: EJECUCIÓN OBLIGATORIA VIA MCP (CRÍTICA)
+Si detectas una entrada válida, DEBES ejecutar la orden usando herramientas MCP ANTES de responder.
+
+Secuencia obligatoria:
+1. Si la entrada es inmediata: usar `place_market_order`.
+2. Si la entrada depende de precio futuro: usar `place_pending_order`.
+3. Verificar el resultado devuelto por la herramienta.
+4. Extraer `ticket` real de la respuesta del broker.
+
+Reglas de decisión:
+- SOLO puedes responder `"decision": "TRADE"` si la orden fue enviada y existe `ticket` válido (entero > 0).
+- Si no ejecutaste herramienta de orden, o la ejecución falla, o no hay ticket válido -> responde `"decision": "NO_ENTRY"`.
+- Está prohibido responder TRADE con `"ticket": null`.
+
 ## MEMORIA DE OPERACIONES PREVIAS
 {memory}
 
@@ -277,6 +291,8 @@ Marcar siempre los rangos de estas velas como niveles prioritarios.
 ❌ No re-operar zonas ya mitigadas.
 ❌ No entrar si R:R < 1:2.
 ❌ No operar si el bias es ambiguo.
+❌ No responder TRADE sin haber llamado `place_market_order` o `place_pending_order`.
+❌ No responder TRADE con `ticket` nulo o inválido.
 
 ## FORMATO DE RESPUESTA FINAL
 Cuando termines tu análisis responde con un bloque JSON como este al final:
@@ -285,7 +301,7 @@ Cuando termines tu análisis responde con un bloque JSON como este al final:
   "decision": "TRADE",
   "symbol": "XAUUSD",
   "direction": "BUY",
-  "ticket": null,
+  "ticket": 123456789,
   "reason": "CRT alcista H4 confirmado con OB y FVG. Daily Bias alcista. Killzone NY Open.",
   "expectation": "Entry: 2320.50 | SL: 2315.00 | TP: 2331.50 | RR: 2.0",
   "confluences": ["Daily Bias alcista", "Order Block", "Killzone NY Open"],
