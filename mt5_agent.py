@@ -156,6 +156,31 @@ def format_memory_for_prompt(memory: list[dict]) -> str:
   return "\n".join(lines)
 
 
+def format_memory_for_symbol(memory: list[dict], symbol: str) -> str:
+  """Formatea memoria histórica únicamente del símbolo objetivo."""
+  symbol_upper = symbol.upper()
+  symbol_memory = [
+    trade for trade in memory
+    if str(trade.get("symbol", "")).upper() == symbol_upper
+  ]
+
+  if not symbol_memory:
+    return f"No hay operaciones previas registradas para {symbol}."
+
+  lines = [
+    f"Se han registrado {len(symbol_memory)} operaciones previas para {symbol}:\n"
+  ]
+  for t in symbol_memory[-10:]:
+    lines.append(
+      f"• [{t.get('saved_at', '?')[:16]}] "
+      f"Ticket {t.get('ticket', '?')} | "
+      f"{t.get('symbol', '?')} {t.get('direction', '?')} | "
+      f"Razón: {t.get('reason', '?')[:80]} | "
+      f"Expectativa: {t.get('expectation', '?')[:80]}"
+    )
+  return "\n".join(lines)
+
+
 # ──────────────────────────────────────────────────────────────
 # CONVERSIÓN MCP TOOLS → FORMATO LITELLM (OpenAI)
 # ──────────────────────────────────────────────────────────────
@@ -431,6 +456,177 @@ def extract_decision(text: str) -> dict | None:
   return None
 
 
+def build_user_message_for_symbol(
+    symbol: str,
+    now_utc: datetime,
+    execution_windows: list[tuple[time, time]],
+    fixed_lot: float,
+) -> str:
+  """Construye el prompt de usuario para un único símbolo."""
+  return (
+      f"Opera la estrategia CRT (Candle Range Theory) de Cluti Fx para este activo: "
+      f"{symbol}.\n\n"
+      f"Hora actual UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}.\n"
+      f"Ventanas operativas UTC configuradas: {format_windows_utc(execution_windows)}.\n\n"
+      "FLUJO OBLIGATORIO:\n"
+      "1. Revisa las posiciones abiertas con la herramienta correspondiente.\n"
+      f"2. Para este activo obtén velas de {', '.join(TIMEFRAMES)}.\n"
+      "3. Determina el Daily Bias en D1 (alcista / bajista / ambiguo).\n"
+      "4. Si el bias está definido, identifica el setup CRT en H4 (velas 1am/5am EST de referencia).\n"
+      "5. Baja a M15 para confirmar la Vela 3 (cierre dentro del rango) y buscar confluencias "
+      "(Order Block, FVG, Killzone).\n"
+      "6. Si todos los filtros pasan, ejecuta la operación con SL y TP definidos (RR >= 2) "
+      "usando place_market_order o place_pending_order.\n"
+      f"7. LOTAJE FIJO OBLIGATORIO: usa exactamente {fixed_lot} lotes. "
+      "No propongas ni uses otro volumen.\n"
+      "8. SOLO devuelve decision=TRADE si la orden fue ejecutada y tienes ticket real (>0). "
+      "Si no hay ticket válido, devuelve NO_ENTRY.\n"
+      "9. No mezcles análisis ni velas con otros símbolos. Este contexto es exclusivo de este activo.\n"
+      "10. Responde con el bloque JSON de decisión."
+  )
+
+
+async def run_symbol_agent_loop(
+    session: ClientSession,
+    symbol: str,
+    now_utc: datetime,
+    execution_windows: list[tuple[time, time]],
+    system_prompt: str,
+    litellm_tools: list[dict],
+    fixed_lot: float,
+) -> dict | None:
+  """Ejecuta un loop de decisión completo del modelo para un único símbolo."""
+  user_message = build_user_message_for_symbol(
+    symbol=symbol,
+    now_utc=now_utc,
+    execution_windows=execution_windows,
+    fixed_lot=fixed_lot,
+  )
+
+  messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
+  iteration = 0
+  final_decision = None
+  executed_order_ticket: int | None = None
+  attempted_order_placement = False
+
+  while iteration < MAX_AGENT_ITERATIONS:
+    iteration += 1
+    log.info("── %s | Iteración %s %s", symbol, iteration, "─" * 30)
+
+    # Llamada al modelo para este símbolo
+    msg, finish_reason = call_model_with_openai_sdk(
+      model=MODEL,
+      messages=[{"role": "system", "content": system_prompt}] + messages,
+      tools=litellm_tools,
+    )
+
+    assistant_msg: dict[str, Any] = {
+      "role": "assistant",
+      "content": msg.get("content"),
+    }
+    if msg.get("tool_calls"):
+      assistant_msg["tool_calls"] = msg["tool_calls"]
+    messages.append(assistant_msg)
+
+    tool_calls = msg.get("tool_calls") or []
+    if finish_reason in ("stop", "end_turn") or not tool_calls:
+      content_text = msg.get("content") or ""
+      log.info("\n📋  [%s] Respuesta final del modelo:\n%s\n", symbol, content_text)
+
+      final_decision = extract_decision(content_text)
+
+      if final_decision:
+        final_decision.setdefault("symbol", symbol)
+        decision_type = final_decision.get("decision", "UNKNOWN")
+        log.info("🏁  [%s] DECISIÓN: %s", symbol, decision_type)
+
+        if decision_type == "TRADE":
+          model_ticket = _extract_positive_int(final_decision.get("ticket"))
+          resolved_ticket = model_ticket or executed_order_ticket
+
+          if resolved_ticket:
+            final_decision["ticket"] = resolved_ticket
+            save_trade(final_decision)
+          else:
+            log.warning(
+              "⚠️  [%s] El modelo devolvió TRADE sin ticket real. No se guardará como operación ejecutada.",
+              symbol,
+            )
+            if attempted_order_placement:
+              log.warning(
+                "⚠️  [%s] Hubo intento de colocar orden, pero no se obtuvo ticket válido en la respuesta del broker.",
+                symbol,
+              )
+            else:
+              log.warning(
+                "⚠️  [%s] No hubo llamada a place_market_order/place_pending_order. "
+                "Esto indica análisis hipotético, no ejecución real.",
+                symbol,
+              )
+        else:
+          log.info("⛔  [%s] Sin entrada. Razón: %s", symbol, final_decision.get("reason", "N/A"))
+      else:
+        log.warning("⚠️  [%s] No se encontró bloque de decisión JSON en la respuesta.", symbol)
+
+      return final_decision
+
+    tool_results = []
+    for tool_call in tool_calls:
+      fn_name = tool_call["function"]["name"]
+      fn_args_raw = tool_call["function"].get("arguments", "{}")
+      fn_args = json.loads(fn_args_raw) if isinstance(fn_args_raw, str) else fn_args_raw
+
+      if fn_name in ("place_market_order", "place_pending_order"):
+        fn_args, lot_overridden = enforce_fixed_lot(fn_args, fixed_lot)
+        if lot_overridden:
+          log.info(
+            "    [%s] ℹ️ Lote forzado por configuración TRADE_LOT=%s (se ignoró el lote propuesto por el modelo).",
+            symbol,
+            fixed_lot,
+          )
+
+      log.info("🔧  [%s] Llamando herramienta: %s", symbol, fn_name)
+      log.info("    [%s] Args: %s", symbol, json.dumps(fn_args, ensure_ascii=False)[:200])
+
+      try:
+        result = await asyncio.wait_for(
+          session.call_tool(fn_name, arguments=fn_args),
+          timeout=MCP_TOOL_TIMEOUT_SEC,
+        )
+        result_text = " ".join(
+          block.text if hasattr(block, "text") else str(block)
+          for block in result.content
+        )
+        log.info("    [%s] ✓ Resultado (%s chars)", symbol, len(result_text))
+
+        if fn_name in ("place_market_order", "place_pending_order"):
+          attempted_order_placement = True
+          parsed_ticket = extract_ticket_from_tool_result(result_text)
+          if parsed_ticket:
+            executed_order_ticket = parsed_ticket
+            log.info("    [%s] ✓ Ticket detectado en ejecución real: %s", symbol, parsed_ticket)
+          else:
+            log.warning("    [%s] ⚠️ Orden enviada pero no se pudo extraer ticket del resultado.", symbol)
+      except Exception as exc:
+        result_text = f"ERROR al ejecutar {fn_name}: {exc}"
+        log.error("    [%s] ✗ %s", symbol, result_text)
+
+      tool_results.append({
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "content": result_text,
+      })
+
+    messages.extend(tool_results)
+
+  log.warning(
+    "\n⚠️  [%s] Se alcanzó el límite de %s iteraciones sin decisión final.",
+    symbol,
+    MAX_AGENT_ITERATIONS,
+  )
+  return final_decision
+
+
 # ──────────────────────────────────────────────────────────────
 # AGENTE PRINCIPAL
 # ──────────────────────────────────────────────────────────────
@@ -501,34 +697,7 @@ async def run_agent() -> None:
     )
 
   memory = load_memory()
-  memory_text = format_memory_for_prompt(memory)
-
-  system_prompt = load_system_prompt().format(memory=memory_text)
-  user_message = (
-      f"Opera la estrategia CRT (Candle Range Theory) de Cluti Fx para los siguientes activos: "
-      f"{', '.join(SYMBOLS)}.\n\n"
-      f"Hora actual UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S')}.\n"
-      f"Ventanas operativas UTC configuradas: {format_windows_utc(execution_windows)}.\n\n"
-      "FLUJO OBLIGATORIO:\n"
-      "1. Revisa las posiciones abiertas con la herramienta correspondiente.\n"
-      f"2. Para cada activo obtén velas de {', '.join(TIMEFRAMES)}.\n"
-      "3. Determina el Daily Bias en D1 (alcista / bajista / ambiguo).\n"
-      "4. Si el bias está definido, identifica el setup CRT en H4 (velas 1am/5am EST de referencia).\n"
-      "5. Baja a M15 para confirmar la Vela 3 (cierre dentro del rango) y buscar confluencias "
-      "(Order Block, FVG, Killzone).\n"
-      "6. Si todos los filtros pasan, ejecuta la operación con SL y TP definidos (RR >= 2) "
-      "usando place_market_order o place_pending_order.\n"
-      f"7. LOTAJE FIJO OBLIGATORIO: usa exactamente {fixed_lot} lotes. "
-      "No propongas ni uses otro volumen.\n"
-      "8. SOLO devuelve decision=TRADE si la orden fue ejecutada y tienes ticket real (>0). "
-      "Si no hay ticket válido, devuelve NO_ENTRY.\n"
-      "9. Responde con el bloque JSON de decisión."
-  )
-
-  messages = [
-      {"role": "user", "content": user_message},
-  ]
-
+  system_prompt_template = load_system_prompt()
   async with AsyncExitStack() as stack:
     # ── Conexión al MCP ────────────────────────────────────
     log.info("\n🔌  Conectando al servidor MCP de MetaTrader 5...")
@@ -563,136 +732,40 @@ async def run_agent() -> None:
 
     log.info("✅  MCP conectado. Herramientas disponibles: %s\n", [t.name for t in available_tools])
 
-    # ── Agentic Loop ───────────────────────────────────────
-    iteration = 0
-    final_decision = None
-    executed_order_ticket: int | None = None
-    attempted_order_placement = False
+    # ── Ejecución independiente por símbolo ────────────────
+    symbol_decisions: list[dict] = []
+    for symbol in SYMBOLS:
+      log.info("\n📈  Iniciando análisis independiente para %s", symbol)
+      symbol_memory_text = format_memory_for_symbol(memory, symbol)
+      system_prompt = system_prompt_template.format(memory=symbol_memory_text)
+      try:
+        decision = await run_symbol_agent_loop(
+          session=session,
+          symbol=symbol,
+          now_utc=now_utc,
+          execution_windows=execution_windows,
+          system_prompt=system_prompt,
+          litellm_tools=litellm_tools,
+          fixed_lot=fixed_lot,
+        )
+      except Exception as exc:
+        log.error("❌  Error analizando %s: %s", symbol, exc, exc_info=True)
+        continue
 
-    while iteration < MAX_AGENT_ITERATIONS:
-      iteration += 1
-      log.info("── Iteración %s %s", iteration, "─" * 40)
-
-      # Llamada al modelo
-      msg, finish_reason = call_model_with_openai_sdk(
-          model=MODEL,
-          messages=[{"role": "system", "content": system_prompt}] + messages,
-          tools=litellm_tools,
-      )
-
-      # Agregar respuesta del asistente al historial
-      assistant_msg: dict[str, Any] = {
-          "role": "assistant",
-          "content": msg.get("content")
-      }
-      if msg.get("tool_calls"):
-        assistant_msg["tool_calls"] = msg["tool_calls"]
-      messages.append(assistant_msg)
-
-      # ── El modelo decidió terminar (sin más tool calls) ─
-      tool_calls = msg.get("tool_calls") or []
-      if finish_reason in ("stop", "end_turn") or not tool_calls:
-        content_text = msg.get("content") or ""
-        log.info("\n📋  Respuesta final del modelo:\n%s\n", content_text)
-
-        # Extraer decisión JSON
-        final_decision = extract_decision(content_text)
-
-        if final_decision:
-          decision_type = final_decision.get("decision", "UNKNOWN")
-          log.info("🏁  DECISIÓN: %s", decision_type)
-          if decision_type == "TRADE":
-            model_ticket = _extract_positive_int(final_decision.get("ticket"))
-            resolved_ticket = model_ticket or executed_order_ticket
-
-            if resolved_ticket:
-              final_decision["ticket"] = resolved_ticket
-              save_trade(final_decision)
-            else:
-              log.warning(
-                "⚠️  El modelo devolvió TRADE sin ticket real. No se guardará como operación ejecutada."
-              )
-              if attempted_order_placement:
-                log.warning(
-                  "⚠️  Hubo intento de colocar orden, pero no se obtuvo ticket válido en la respuesta del broker."
-                )
-              else:
-                log.warning(
-                  "⚠️  No hubo llamada a place_market_order/place_pending_order. "
-                  "Esto indica análisis hipotético, no ejecución real."
-                )
-          else:
-            log.info("⛔  Sin entrada. Razón: %s", final_decision.get("reason", "N/A"))
-        else:
-          log.warning("⚠️  No se encontró bloque de decisión JSON en la respuesta.")
-
-        break   # ← Salir del loop
-
-      # ── Ejecutar tool calls ────────────────────────────
-      tool_results = []
-      for tool_call in tool_calls:
-        fn_name = tool_call["function"]["name"]
-        fn_args_raw = tool_call["function"].get("arguments", "{}")
-        fn_args = json.loads(fn_args_raw) if isinstance(
-          fn_args_raw, str) else fn_args_raw
-
-        if fn_name in ("place_market_order", "place_pending_order"):
-          fn_args, lot_overridden = enforce_fixed_lot(fn_args, fixed_lot)
-          if lot_overridden:
-            log.info(
-              "    ℹ️ Lote forzado por configuración TRADE_LOT=%s (se ignoró el lote propuesto por el modelo).",
-              fixed_lot,
-            )
-
-        log.info("🔧  Llamando herramienta: %s", fn_name)
-        log.info("    Args: %s", json.dumps(fn_args, ensure_ascii=False)[:200])
-
-        try:
-          result = await asyncio.wait_for(
-            session.call_tool(fn_name, arguments=fn_args),
-            timeout=MCP_TOOL_TIMEOUT_SEC,
-          )
-          # Convertir resultado MCP a texto
-          result_text = " ".join(
-              block.text if hasattr(block, "text") else str(block)
-              for block in result.content
-          )
-          log.info("    ✓ Resultado (%s chars)", len(result_text))
-
-          if fn_name in ("place_market_order", "place_pending_order"):
-            attempted_order_placement = True
-            parsed_ticket = extract_ticket_from_tool_result(result_text)
-            if parsed_ticket:
-              executed_order_ticket = parsed_ticket
-              log.info("    ✓ Ticket detectado en ejecución real: %s", parsed_ticket)
-            else:
-              log.warning("    ⚠️ Orden enviada pero no se pudo extraer ticket del resultado.")
-        except Exception as exc:
-          result_text = f"ERROR al ejecutar {fn_name}: {exc}"
-          log.error("    ✗ %s", result_text)
-
-        tool_results.append({
-            "role": "tool",
-          "tool_call_id": tool_call["id"],
-            "content": result_text,
-        })
-
-      messages.extend(tool_results)
-
-    else:
-      log.warning(
-        "\n⚠️  Se alcanzó el límite de %s iteraciones sin decisión final.",
-        MAX_AGENT_ITERATIONS,
-      )
+      if decision:
+        symbol_decisions.append(decision)
 
   log.info("\n%s", "=" * 60)
   log.info("✅  Ejecución del agente completada.")
-  if final_decision:
-    log.info(
-      "    Decisión: %s | Símbolo: %s",
-      final_decision.get("decision"),
-      final_decision.get("symbol", "N/A"),
-    )
+  if symbol_decisions:
+    for decision in symbol_decisions:
+      log.info(
+        "    Decisión: %s | Símbolo: %s",
+        decision.get("decision", "UNKNOWN"),
+        decision.get("symbol", "N/A"),
+      )
+  else:
+    log.info("    Sin decisiones registradas en esta corrida.")
   log.info("%s\n", "=" * 60)
 
 
