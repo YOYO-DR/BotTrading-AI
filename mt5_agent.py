@@ -47,6 +47,7 @@ BASE_URL = os.getenv("BASE_URL", "")
 MCP_CONNECT_TIMEOUT_SEC = float(os.getenv("MCP_CONNECT_TIMEOUT_SEC", "30"))
 LLM_REQUEST_TIMEOUT_SEC = float(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "90"))
 LLM_USER_AGENT = os.getenv("LLM_USER_AGENT", "curl/8.17.0")
+TRADE_LOT_RAW = os.getenv("TRADE_LOT", "0.01")
 
 # pares CRT (Gold, NQ, Forex)
 SYMBOLS = [
@@ -162,6 +163,43 @@ def mcp_tools_to_litellm(mcp_tools) -> list[dict]:
         },
     })
   return result
+
+
+def get_trade_lot() -> float:
+  """Obtiene y valida el lotaje fijo desde variable de entorno."""
+  try:
+    lot = float(TRADE_LOT_RAW)
+  except ValueError as exc:
+    raise RuntimeError(
+      f"TRADE_LOT inválido: '{TRADE_LOT_RAW}'. Debe ser numérico (ej: 0.01)."
+    ) from exc
+
+  if lot <= 0:
+    raise RuntimeError(f"TRADE_LOT debe ser > 0. Valor recibido: {lot}")
+
+  return lot
+
+
+def enforce_fixed_lot(fn_args: Any, fixed_lot: float) -> tuple[dict[str, Any], bool]:
+  """Fuerza el lotaje fijo para órdenes, ignorando cualquier lote propuesto por el modelo."""
+  if not isinstance(fn_args, dict):
+    return {"volume": fixed_lot}, True
+
+  overridden = False
+  lot_keys = ("volume", "lot", "lots", "lot_size", "size")
+
+  for key in lot_keys:
+    if key in fn_args:
+      previous = fn_args.get(key)
+      fn_args[key] = fixed_lot
+      if previous != fixed_lot:
+        overridden = True
+
+  if "volume" not in fn_args:
+    fn_args["volume"] = fixed_lot
+    overridden = True
+
+  return fn_args, overridden
 
 
 def _extract_positive_int(value: Any) -> int | None:
@@ -327,6 +365,8 @@ async def run_agent() -> None:
   if not OPENAI_API_KEY:
     raise RuntimeError("Falta OPENAI_API_KEY en variables de entorno o .env")
 
+  fixed_lot = get_trade_lot()
+
   if shutil.which(MCP_SERVER_COMMAND) is None:
     raise RuntimeError(
       "No se encontró el ejecutable del servidor MCP: "
@@ -348,11 +388,13 @@ async def run_agent() -> None:
       "4. Si el bias está definido, identifica el setup CRT en H4 (velas 1am/5am EST de referencia).\n"
       "5. Baja a M15 para confirmar la Vela 3 (cierre dentro del rango) y buscar confluencias "
       "(Order Block, FVG, Killzone).\n"
-        "6. Si todos los filtros pasan, ejecuta la operación con SL y TP definidos (RR >= 2) "
-        "usando place_market_order o place_pending_order.\n"
-        "7. SOLO devuelve decision=TRADE si la orden fue ejecutada y tienes ticket real (>0). "
-        "Si no hay ticket válido, devuelve NO_ENTRY.\n"
-        "8. Responde con el bloque JSON de decisión."
+      "6. Si todos los filtros pasan, ejecuta la operación con SL y TP definidos (RR >= 2) "
+      "usando place_market_order o place_pending_order.\n"
+      f"7. LOTAJE FIJO OBLIGATORIO: usa exactamente {fixed_lot} lotes. "
+      "No propongas ni uses otro volumen.\n"
+      "8. SOLO devuelve decision=TRADE si la orden fue ejecutada y tienes ticket real (>0). "
+      "Si no hay ticket válido, devuelve NO_ENTRY.\n"
+      "9. Responde con el bloque JSON de decisión."
   )
 
   messages = [
@@ -462,6 +504,14 @@ async def run_agent() -> None:
         fn_args_raw = tool_call["function"].get("arguments", "{}")
         fn_args = json.loads(fn_args_raw) if isinstance(
           fn_args_raw, str) else fn_args_raw
+
+        if fn_name in ("place_market_order", "place_pending_order"):
+          fn_args, lot_overridden = enforce_fixed_lot(fn_args, fixed_lot)
+          if lot_overridden:
+            log.info(
+              "    ℹ️ Lote forzado por configuración TRADE_LOT=%s (se ignoró el lote propuesto por el modelo).",
+              fixed_lot,
+            )
 
         log.info("🔧  Llamando herramienta: %s", fn_name)
         log.info("    Args: %s", json.dumps(fn_args, ensure_ascii=False)[:200])
